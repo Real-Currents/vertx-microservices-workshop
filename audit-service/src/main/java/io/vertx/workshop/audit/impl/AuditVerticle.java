@@ -15,6 +15,7 @@ import io.vertx.ext.sql.SQLConnection;
 import io.vertx.ext.sql.UpdateResult;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
+import io.vertx.servicediscovery.Record;
 import io.vertx.servicediscovery.types.MessageSource;
 import io.vertx.workshop.common.Chain;
 import io.vertx.workshop.common.MicroServiceVerticle;
@@ -49,9 +50,29 @@ public class AuditVerticle extends MicroServiceVerticle {
     // creates the jdbc client.
     jdbc = JDBCClient.createNonShared(vertx, config());
 
-    // TODO
     // ----
-    future.fail("not implemented yet");
+    Future<Void> databaseReady = initializeDatabase(config().getBoolean("drop", false));
+    Future<MessageConsumer<JsonObject>> messageListenerReady = retrieveThePortfolioMessageSource();
+    Future<Void> httpEndpointReady = configureTheHTTPServer().compose(
+        server -> {
+          Future<Void> regFuture = Future.future();
+          publishHttpEndpoint("audit", "localhost", server.actualPort(), regFuture.completer());
+          return regFuture;
+        }
+    );
+
+    CompositeFuture.all(httpEndpointReady, databaseReady, messageListenerReady)
+        .setHandler(ar -> {
+          if (ar.succeeded()) {
+            // Register the handle called on messages
+            messageListenerReady.result().handler(message -> storeInDatabase(message.body()));
+            // Notify the completion
+            future.complete();
+          } else {
+            future.fail(ar.cause());
+          }
+        });
+
     // ----
   }
 
@@ -69,18 +90,46 @@ public class AuditVerticle extends MicroServiceVerticle {
     // 4. close the connection
     // 5. return this list in the response
 
-    //TODO
     // ----
+    // 1 - we retrieve the connection
+    jdbc.getConnection(ar -> {
+      if (ar.failed()) {
+        context.fail(ar.cause());
+      } else {
+        SQLConnection connection = ar.result();
+        // 2. we execute the query
+        connection.query(SELECT_STATEMENT, result -> {
+          ResultSet set = result.result();
 
+          // 3. Build the list of operations
+          List<JsonObject> operations = set.getRows().stream()
+              .map(json -> new JsonObject(json.getString("OPERATION")))
+              .collect(Collectors.toList());
+
+          // 4. Close the connection
+          connection.close();
+
+          // 5. Send the list to the response
+          context.response().setStatusCode(200).end(Json.encodePrettily(operations));
+
+
+        });
+      }
+    });
     // ----
   }
 
   private Future<HttpServer> configureTheHTTPServer() {
     Future<HttpServer> future = Future.future();
 
-    //TODO
     //----
+    // Use a Vert.x Web router for this REST API.
+    Router router = Router.router(vertx);
+    router.get("/").handler(this::retrieveOperations);
 
+    vertx.createHttpServer()
+        .requestHandler(router::accept)
+        .listen(config().getInteger("http.port", 0), future.completer());
     //----
     return future;
   }
@@ -128,6 +177,7 @@ public class AuditVerticle extends MicroServiceVerticle {
   }
 
   private Future<Void> initializeDatabase(boolean drop) {
+
     // The database initialization is a multi-step process:
     // 1. Retrieve the connection
     // 2. Drop the table is exist
